@@ -7,7 +7,9 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.synapse.Mediator;
 import org.apache.synapse.MessageContext;
+import org.apache.synapse.SynapseConstants;
 import org.apache.synapse.config.SynapseConfiguration;
+import org.apache.synapse.core.axis2.Axis2MessageContext;
 import org.apache.synapse.endpoints.HTTPEndpoint;
 import org.apache.synapse.mediators.AbstractMediator;
 import org.apache.synapse.mediators.filters.FilterMediator;
@@ -15,6 +17,7 @@ import org.apache.synapse.mediators.base.SequenceMediator;
 import org.apache.synapse.mediators.builtin.SendMediator;
 import org.apache.synapse.rest.API;
 import org.apache.synapse.rest.Resource;
+import org.apache.synapse.transport.nhttp.NhttpConstants;
 
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -26,10 +29,31 @@ import javax.annotation.CheckForNull;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
+/**
+ * This custom Mediator enables calling the Google Map API using the Client ID method, for users who purchase a licence
+ * from Google[1]. Google will provide a Client ID and Cryptographic Private Key to users which needs to be passed
+ * as property parameters to this mediator when it is engaged. Below example shows how to engage this mediator
+ * in a sequence with the required Client ID and Private Key.
+ *
+ *      <sequence xmlns="http://ws.apache.org/ns/synapse" name="GoogleMapApiSequence">
+ *          <class name="org.wso2.sample.GoogleMapApiMediator">
+ *              <property name="PrivateKey" value="vNIXE0xscrmjlyV-12Nj_BvUPaw="/>
+ *              <property name="ClientID" value="clientID"/>
+ *          </class>
+ *      </sequence>
+ *
+ * When engaging the mediator as above ensure that you substitute your own Private Key and Client ID values in the
+ * respective properties.
+ *
+ * [1] https://developers.google.com/maps/documentation/geocoding/get-api-key#client-id
+ *
+ */
+
 public class GoogleMapApiMediator extends AbstractMediator {
     private static final Log log = LogFactory.getLog(GoogleMapApiMediator.class);
 
     private String privateKey;
+    private String clientId;
 
     private static final String HMAC_SHA1_ALGORITHM = "HmacSHA1";
 
@@ -41,13 +65,27 @@ public class GoogleMapApiMediator extends AbstractMediator {
     private static final String FILTER_MEDIATOR = "FilterMediator";
     private static final String SEND_MEDIATOR = "SendMediator";
     private static final String QUERY_PARAM_KEY_CLIENT = "client";
-    private static final String QUERY_PARAM_VALUE_CLIENT = "clientID";
     private static final String QUERY_PARAM_CLIENT_PROPERTY = "query.param.client";
     private static final String QUERY_PARAM_SIGNATURE_PROPERTY = "query.param.signature";
 
+    class MediatorException extends Exception {
+        MediatorException(String msg) {
+            super(msg);
+        }
+    }
 
     @Override
     public boolean mediate(MessageContext messageContext) {
+        if (privateKey == null) {
+            log.error("Required Property 'privateKey' has not be defined in mediator");
+            return triggerServerError(messageContext); // Interrupt execution flow
+        }
+
+        if (clientId == null) {
+            log.error("Required Property 'clientId' has not be defined in mediator");
+            return triggerServerError(messageContext); // Interrupt execution flow
+        }
+
         String apiKey = (String) messageContext.getProperty(CURRENT_API_KEY);
 
         if (log.isDebugEnabled()) {
@@ -58,28 +96,26 @@ public class GoogleMapApiMediator extends AbstractMediator {
 
         API api = synapseConfiguration.getAPI(apiKey);
 
-        String completeURL = constructURLWithQueryParams(api, messageContext);
-
-        if (log.isDebugEnabled()) {
-            log.debug("Complete endpoint URL: " + completeURL);
-        }
-
         try {
+            String completeURL = constructURLWithQueryParams(api, messageContext);
+
+            if (log.isDebugEnabled()) {
+                log.debug("Complete endpoint URL: " + completeURL);
+            }
+
             URL url = new URL(completeURL);
             String signature = signURL(url);
 
             if (log.isDebugEnabled()) {
                 log.debug("Signed signature: " + signature);
             }
-            messageContext.setProperty(QUERY_PARAM_CLIENT_PROPERTY, QUERY_PARAM_VALUE_CLIENT);
+            messageContext.setProperty(QUERY_PARAM_CLIENT_PROPERTY, clientId);
             messageContext.setProperty(QUERY_PARAM_SIGNATURE_PROPERTY, signature);
 
-        } catch (MalformedURLException e) {
-            log.error("Malformed URL detected", e);
-        } catch (NoSuchAlgorithmException e) {
-            log.error("No such algorithm detected", e);
-        } catch (InvalidKeyException e) {
-            log.error("Private Key is invalid", e);
+        } catch (MalformedURLException | MediatorException |
+                NoSuchAlgorithmException | InvalidKeyException e) {
+            log.error(e);
+            return triggerServerError(messageContext);
         }
 
         return true;
@@ -96,13 +132,44 @@ public class GoogleMapApiMediator extends AbstractMediator {
     }
 
     /**
+     * Setter function to set property clientId. This function will be automatically called when this mediator is
+     * engaged and will be set with the value of the corresponding property named 'clientId' which should be defined
+     * along side the use of the mediator
+     * @param clientId value of the Client ID
+     */
+    public void setClientID(String clientId) {
+        this.clientId = clientId;
+    }
+
+    /**
+     * Trigger an internal server error to denote that an unrecoverable issue has been encountered by the mediator.
+     * This can be used to interrupt the execution flow.
+     *
+     * @param messageContext Synapse message context
+     * @return always returns false
+     */
+    private boolean triggerServerError(MessageContext messageContext) {
+        messageContext.setProperty(SynapseConstants.RESPONSE, "true");
+        org.apache.axis2.context.MessageContext axis2MessageContext = ((Axis2MessageContext) messageContext).
+                                                                                            getAxis2MessageContext();
+        axis2MessageContext.removeProperty(NhttpConstants.NO_ENTITY_BODY);
+        axis2MessageContext.setProperty(NhttpConstants.HTTP_SC, "500");
+
+        messageContext.setTo(null);
+        SendMediator sendMediator = new SendMediator();
+        sendMediator.mediate(messageContext);
+
+        return false;
+    }
+
+    /**
      * Get endpoint URL configured in the API
      *
      * @param api Model representing the Synapse API object instance that this mediator is being engaged from
      * @param messageContext Synapse message context
      * @return Endpoint URL string
      */
-    private String getEndpointURL(API api, MessageContext messageContext) {
+    private String getEndpointURL(API api, MessageContext messageContext) throws MediatorException {
         Resource[] resources = api.getResources();
 
         if (resources.length > 0) {
@@ -143,9 +210,7 @@ public class GoogleMapApiMediator extends AbstractMediator {
             }
         }
 
-        String msg = "Could not locate endpoint URL in synapse configuration";
-        log.error(msg); // Log error
-        throw new IllegalStateException(msg); // Throw to interrupt execution of mediator
+        throw new MediatorException("Could not locate endpoint URL in synapse configuration");
     }
 
     /**
@@ -180,7 +245,7 @@ public class GoogleMapApiMediator extends AbstractMediator {
      * @param messageContext Synapse message context
      * @return String representation of URL
      */
-    private String constructURLWithQueryParams(API api, MessageContext messageContext) {
+    private String constructURLWithQueryParams(API api, MessageContext messageContext) throws MediatorException {
         String endpointURL = getEndpointURL(api, messageContext);
 
         if (log.isDebugEnabled()) {
@@ -212,9 +277,9 @@ public class GoogleMapApiMediator extends AbstractMediator {
 
         // Append query parameters that were sent(if they exist) and the clientID query parameter to the endpointURL
         if (queryParamsString !=  null) {
-            return endpointURL + '?' + queryParamsString + '&' + QUERY_PARAM_KEY_CLIENT + '=' + QUERY_PARAM_VALUE_CLIENT;
+            return endpointURL + '?' + queryParamsString + '&' + QUERY_PARAM_KEY_CLIENT + '=' + clientId;
         } else { // Could not detect Query Params
-            return endpointURL + '?' + QUERY_PARAM_KEY_CLIENT + '=' + QUERY_PARAM_VALUE_CLIENT;
+            return endpointURL + '?' + QUERY_PARAM_KEY_CLIENT + '=' + clientId;
         }
     }
 
@@ -258,20 +323,12 @@ public class GoogleMapApiMediator extends AbstractMediator {
      * @return Converted binary string
      */
     private byte[] convertBase64KeyToBinary() {
-        if (privateKey == null) {
-            String msg = "Required Property privateKey has not be defined in mediator";
-            log.error(msg); // Log error
-            throw new IllegalStateException(msg); // Throw to interrupt execution of mediator
-        }
-
         // Convert the key from 'web safe' base 64 to standard base 64
         String base64Value = privateKey.replace('-', '+');
         base64Value = base64Value.replace('_', '/');
 
         return Base64.getDecoder().decode(base64Value);
-
     }
-
 }
 
 
