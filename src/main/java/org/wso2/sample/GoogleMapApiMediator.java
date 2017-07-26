@@ -60,13 +60,11 @@ public class GoogleMapApiMediator extends AbstractMediator {
     private static final String WILDCARD_RESOURCE_VALUE = "/*";
     private static final String CURRENT_API_KEY = "SYNAPSE_REST_API";
     private static final String RESOURCE_INVOKED_KEY = "API_ELECTED_RESOURCE";
-    private static final String SUB_REQUEST_PATH_KEY = "REST_SUB_REQUEST_PATH";
 
     private static final String FILTER_MEDIATOR = "FilterMediator";
     private static final String SEND_MEDIATOR = "SendMediator";
     private static final String QUERY_PARAM_KEY_CLIENT = "client";
-    private static final String QUERY_PARAM_CLIENT_PROPERTY = "query.param.client";
-    private static final String QUERY_PARAM_SIGNATURE_PROPERTY = "query.param.signature";
+    private static final String QUERY_PARAM_KEY_SIGNATURE = "signature";
 
     class MediatorException extends Exception {
         MediatorException(String msg) {
@@ -97,7 +95,7 @@ public class GoogleMapApiMediator extends AbstractMediator {
         API api = synapseConfiguration.getAPI(apiKey);
 
         try {
-            String completeURL = constructURLWithQueryParams(api, messageContext);
+            String completeURL = constructURLForSigning(api, messageContext);
 
             if (log.isDebugEnabled()) {
                 log.debug("Complete endpoint URL: " + completeURL);
@@ -109,8 +107,8 @@ public class GoogleMapApiMediator extends AbstractMediator {
             if (log.isDebugEnabled()) {
                 log.debug("Signed signature: " + signature);
             }
-            messageContext.setProperty(QUERY_PARAM_CLIENT_PROPERTY, clientId);
-            messageContext.setProperty(QUERY_PARAM_SIGNATURE_PROPERTY, signature);
+
+            appendClientAndSignature(messageContext, signature);
 
         } catch (MalformedURLException | MediatorException |
                 NoSuchAlgorithmException | InvalidKeyException e) {
@@ -140,6 +138,34 @@ public class GoogleMapApiMediator extends AbstractMediator {
     public void setClientID(String clientId) {
         this.clientId = clientId;
     }
+
+    /**
+     * Appends the 'client' and the calculated 'signature' query parameters to the URL path
+     * @param messageContext Synapse message context
+     * @param signature Signed URL signature
+     */
+    private void appendClientAndSignature(MessageContext messageContext, String signature) {
+        org.apache.axis2.context.MessageContext axis2MessageContext = ((Axis2MessageContext) messageContext).
+                getAxis2MessageContext();
+
+        String restURLPostFix = (String) axis2MessageContext.getProperty(NhttpConstants.REST_URL_POSTFIX);
+
+        if (log.isDebugEnabled()) {
+            log.debug("Original REST_URL_POSTFIX: " + restURLPostFix);
+        }
+
+        // Append the 'client' and 'signature' query parameters
+        restURLPostFix += '&' + QUERY_PARAM_KEY_CLIENT + '=' + clientId + '&' +
+                QUERY_PARAM_KEY_SIGNATURE + '=' + signature;
+
+        if (log.isDebugEnabled()) {
+            log.debug("Modified REST_URL_POSTFIX: " + restURLPostFix);
+        }
+
+        // Update REST_URL_POSTFIX property
+        axis2MessageContext.setProperty(NhttpConstants.REST_URL_POSTFIX, restURLPostFix);
+    }
+
 
     /**
      * Trigger an internal server error to denote that an unrecoverable issue has been encountered by the mediator.
@@ -222,10 +248,14 @@ public class GoogleMapApiMediator extends AbstractMediator {
      */
     @CheckForNull
     private String getQueryParamsString(MessageContext messageContext) {
-        String queryString = (String) messageContext.getProperty(SUB_REQUEST_PATH_KEY);
-        if (!StringUtils.isEmpty(queryString)) {
-            if (queryString.contains("?") && !queryString.endsWith("?")) {
-                return queryString.substring(queryString.indexOf("?") + 1);
+        org.apache.axis2.context.MessageContext axis2MessageContext = ((Axis2MessageContext) messageContext).
+                getAxis2MessageContext();
+
+        String restURLPostFix = (String) axis2MessageContext.getProperty(NhttpConstants.REST_URL_POSTFIX);
+
+        if (!StringUtils.isEmpty(restURLPostFix)) {
+            if (restURLPostFix.contains("?") && !restURLPostFix.endsWith("?")) {
+                return restURLPostFix.substring(restURLPostFix.indexOf("?") + 1);
             }
         }
 
@@ -233,7 +263,7 @@ public class GoogleMapApiMediator extends AbstractMediator {
     }
 
     /**
-     * Return string representation of URL having format such as,
+     * Return string representation of URL which will be used for signing, having format such as,
      *
      *    https://maps.googleapis.com/maps/api/geocode/json?address=New+York&client=clientID
      *
@@ -245,7 +275,7 @@ public class GoogleMapApiMediator extends AbstractMediator {
      * @param messageContext Synapse message context
      * @return String representation of URL
      */
-    private String constructURLWithQueryParams(API api, MessageContext messageContext) throws MediatorException {
+    private String constructURLForSigning(API api, MessageContext messageContext) throws MediatorException {
         String endpointURL = getEndpointURL(api, messageContext);
 
         if (log.isDebugEnabled()) {
